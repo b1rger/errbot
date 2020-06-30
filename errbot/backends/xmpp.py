@@ -538,16 +538,16 @@ class XMPPBackend(ErrBot):
         """
         image_url = iq['http_upload_slot']['get']['url']
         log.debug('Image slot received:' + image_url)
-        if self.processing_card is None:
+        if self._processing_card is None:
             return image_url
         m = self.conn.client.Message()
-        m['to'] = str(self.processing_card.to)
-        m['type'] = 'chat' if self.processing_card.is_direct else 'groupchat'
+        m['to'] = str(self._processing_card.to)
+        m['type'] = 'chat' if self._processing_card.is_direct else 'groupchat'
         m['body'] = image_url
         m['oob']['url'] = image_url
         m.send()
 
-        self.processing_card = None
+        self._processing_card = None
 
     def send_card(self, card: Card):
         log.debug("send_card to %s", card.to)

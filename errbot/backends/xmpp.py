@@ -584,12 +584,16 @@ class XMPPBackend(ErrBot):
             log.debug("Trigger shutdown")
             self.shutdown()
 
+    async def _xep0030_get_info(self, txtrep):
+        xep0030 = self.conn.client.plugin['xep_0030']
+        return await xep0030.get_info(jid=txtrep)
+
     @lru_cache(IDENTIFIERS_LRU)
     def build_identifier(self, txtrep):
         log.debug('build identifier for %s', txtrep)
         try:
-            xep0030 = self.conn.client.plugin['xep_0030']
-            info = xep0030.get_info(jid=txtrep)
+            info = asyncio.run_coroutine_threadsafe(
+                self._xep0030_get_info(txtrep), self._loop).result()
             disco_info = info['disco_info']
             if disco_info:  # Hipchat can return an empty response here.
                 for category, typ, _, name in disco_info['identities']:

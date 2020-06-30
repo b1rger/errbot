@@ -496,6 +496,11 @@ class XMPPBackend(ErrBot):
 
     def connected(self, data):
         """Callback for connection events"""
+        # Required to send images or files when using a callback message.
+        # When the bot wants to send a file to the server, it must use the same
+        # event loop as the callback caller.
+        self._loop = asyncio.get_running_loop()
+
         self.connect_callback()
 
     def disconnected(self, data):

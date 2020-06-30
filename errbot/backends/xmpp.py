@@ -1,10 +1,12 @@
 import logging
 import sys
+import os
+import asyncio
 from functools import lru_cache
 
 from time import sleep
 
-from errbot.backends.base import Message, Room, Presence, RoomNotJoinedError, Identifier, RoomOccupant, Person
+from errbot.backends.base import Message, Room, Presence, RoomNotJoinedError, Identifier, RoomOccupant, Person, Card
 from errbot.backends.base import ONLINE, OFFLINE, AWAY, DND
 from errbot.core import ErrBot
 from errbot.rendering import text, xhtml, xhtmlim
@@ -16,6 +18,7 @@ try:
     from slixmpp.xmlstream import resolver, cert
     from slixmpp import JID
     from slixmpp.exceptions import IqError
+    from slixmpp.stanza import Iq
 
 except ImportError:
     log.exception("Could not start the XMPP backend")
@@ -297,7 +300,8 @@ class XMPPRoomOccupant(XMPPPerson, RoomOccupant):
 
 class XMPPConnection(object):
     def __init__(self, jid, password, feature=None, keepalive=None,
-                 ca_cert=None, server=None, use_ipv6=None, bot=None):
+                 ca_cert=None, server=None, use_ipv6=None, bot=None,
+                 ssl_version=None):
         if feature is None:
             feature = {}
         self._bot = bot
@@ -309,6 +313,8 @@ class XMPPConnection(object):
         self.client.register_plugin('xep_0199')  # XMPP Ping
         self.client.register_plugin('xep_0203')  # XMPP Delayed messages
         self.client.register_plugin('xep_0249')  # XMPP direct MUC invites
+        self.client.register_plugin('xep_0363')  # File Upload
+        self.client.register_plugin('xep_0066')  # OOB to send image URLs.
 
         if keepalive is not None:
             self.client.whitespace_keepalive = True  # Just in case Slixmpp's default changes to False in the future
@@ -442,6 +448,12 @@ class XMPPBackend(ErrBot):
 
         msg.nick = xmppmsg['mucnick']
         msg.delayed = bool(xmppmsg['delay']._get_attr('stamp'))  # this is a bug in slixmpp it should be ['from']
+
+        # Required to send images or files when using a callback message.
+        # When the bot wants to send a file to the server, it must use the same
+        # event loop as the callback caller.
+        self._loop = asyncio.get_running_loop()
+
         self.callback_message(msg)
 
     def _idd_from_event(self, event):
@@ -490,6 +502,60 @@ class XMPPBackend(ErrBot):
         """Callback for disconnection events"""
         self.disconnect_callback()
 
+    def send_file(self, card: Card, path: str, content_type: str=None):
+        """
+        Send a file through XEP-0363.
+
+        Image is supported.
+
+        :param path: The image file path.
+        :param content_type: The MIME type (eg.: ``image/png``).
+        """
+        self._processing_card = card
+
+        if not os.path.isfile(path) or not os.path.exists(path):
+            log.info('File to upload does not exists. Nothing to send.')
+            return
+
+        if content_type is not None:
+            asyncio.run_coroutine_threadsafe(
+                self.conn.client['xep_0363'].upload_file(
+                    filename=path,
+                    content_type=content_type,
+                    callback=self._on_file_uploaded), self._loop)
+        else:
+            asyncio.run_coroutine_threadsafe(
+                self.conn.client['xep_0363'].upload_file(
+                    filename=path,
+                    callback=self._on_file_uploaded), self._loop)
+
+    def _on_file_uploaded(self, iq: Iq):
+        """
+        The XEP-0363 uploda_file() callback. Once the server answers with the
+        assigned file URL slot, this function runs.
+
+        Send the image GET URL to the client designed on the Card instance.
+        """
+        image_url = iq['http_upload_slot']['get']['url']
+        log.debug('Image slot received:' + image_url)
+        if self._processing_card is None:
+            return image_url
+        m = self.conn.client.Message()
+        m['to'] = str(self._processing_card.to)
+        m['type'] = 'chat' if self._processing_card.is_direct else 'groupchat'
+        m['body'] = image_url
+        m['oob']['url'] = image_url
+        m.send()
+
+        self._processing_card = None
+
+    def send_card(self, card: Card):
+        log.debug("send_card to %s", card.to)
+
+        if card.image is not None:
+            self.send_file(card, card.image)
+        self.send_message(card)
+
     def send_message(self, msg):
         super().send_message(msg)
 
@@ -518,12 +584,16 @@ class XMPPBackend(ErrBot):
             log.debug("Trigger shutdown")
             self.shutdown()
 
+    async def _xep0030_get_info(self, txtrep):
+        xep0030 = self.conn.client.plugin['xep_0030']
+        return await xep0030.get_info(jid=txtrep)
+
     @lru_cache(IDENTIFIERS_LRU)
     def build_identifier(self, txtrep):
         log.debug('build identifier for %s', txtrep)
         try:
-            xep0030 = self.conn.client.plugin['xep_0030']
-            info = xep0030.get_info(jid=txtrep)
+            info = asyncio.run_coroutine_threadsafe(
+                self._xep0030_get_info(txtrep), self._loop).result()
             disco_info = info['disco_info']
             if disco_info:  # Hipchat can return an empty response here.
                 for category, typ, _, name in disco_info['identities']:
